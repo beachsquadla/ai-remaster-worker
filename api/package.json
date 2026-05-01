@@ -1,0 +1,19 @@
+{
+  "name": "ai-remaster-api",
+  "version": "1.0.0",
+  "description": "VPS-side API for the Hybrid Serverless AI Audio Remastering system. Bridges web UI and RunPod Serverless worker for stem separation.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

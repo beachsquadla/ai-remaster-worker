@@ -1,0 +1,9 @@
+*.log
+*.pyc
+*.pyo
+.env
+__pycache__/
+api/ecosystem.config.js
+node_modules/
+s3-config.json
+storage/

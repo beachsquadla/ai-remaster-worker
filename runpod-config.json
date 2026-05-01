@@ -1,0 +1,35 @@
+{
+  "name": "htdemucs-stem-separator",
+  "endpoint_type": "serverless",
+  "template_id": null,
+  "container_registry_url": "your-registry.example.com/demucs-worker:latest",
+  "container_disk_size_gb": 20,
+  "min_workers": 1,
+  "max_workers": 3,
+  "idle_timeout": 30,
+  "gpu_type_ids": [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA A100 80GB",
+    "NVIDIA A100 SXM4 80GB",
+    "NVIDIA L40S",
+    "NVIDIA RTX 6000 Ada Generation"
+  ],
+  "env_vars": {},
+  "model_id": "htdemucs_6s",
+  "handler": "handler.handler",
+  "description": "HTDemucs 6-stem audio separation (vocals, drums, bass, guitar, piano, other). Accepts audio_url and callback_url, returns stems.tar.gz via multipart POST.",
+  "input_schema": {
+    "type": "object",
+    "required": ["audio_url", "callback_url"],
+    "properties": {
+      "audio_url": {
+        "type": "string",
+        "description": "Public HTTP/HTTPS URL to the audio file to process"
+      },
+      "callback_url": {
+        "type": "string",
+        "description": "URL where the worker should POST the stem archive results"
+      }
+    }
+  }
+}
