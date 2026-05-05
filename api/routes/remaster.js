@@ -79,6 +79,55 @@ function getBaseUrl(req) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/remaster
+// ---------------------------------------------------------------------------
+// Accepts a JSON body with { url, job_id } and submits directly to RunPod.
+// This is the test/debug endpoint for the async workflow.
+//
+// Request: JSON with "url" (public/downloadable URL of audio) and optional "job_id"
+// Response: { job_id, status, stems?, stemUrls?, error? }
+// ---------------------------------------------------------------------------
+router.post("/", async (req, res) => {
+  try {
+    const { url, job_id } = req.body;
+    if (!url) {
+      return res.status(400).json({ error: "Missing required field: 'url'" });
+    }
+
+    const jobId = job_id || crypto.randomBytes(4).toString("hex");
+
+    // Create job in DB if it doesn't exist
+    let job = jobManager.getJob(jobId);
+    if (!job) {
+      job = jobManager.createJob(jobId || "direct-url", "direct-url");
+    }
+    jobManager.updateJobStatus(jobId, "processing");
+
+    console.log(`[Remaster] POST /api/remaster — submitting job ${jobId} with URL: ${url}`);
+
+    // Send to RunPod and wait for the result
+    try {
+      const result = await jobManager.sendToRunPod(jobId, url);
+      return res.json({
+        job_id: jobId,
+        ...result,
+      });
+    } catch (err) {
+      console.error(`[Remaster] RunPod error for job ${jobId}:`, err.message);
+      jobManager.updateJobStatus(jobId, "error", { error: err.message });
+      return res.status(500).json({
+        job_id: jobId,
+        status: "error",
+        error: err.message,
+      });
+    }
+  } catch (err) {
+    console.error("[Remaster] Error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/remaster/upload
 // ---------------------------------------------------------------------------
 // Accepts an audio file upload, creates a job, and sends it to RunPod
@@ -429,6 +478,138 @@ router.get("/jobs", (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/remaster/master
+// ---------------------------------------------------------------------------
+// Accepts an audio file, optional reference track, and a mastering preset.
+// Runs the full DSP mastering pipeline on the VPS CPU.
+//
+// Request: multipart/form-data with fields:
+//   - file (required): Audio file to master
+//   - preset (optional): 'clean', 'warm', 'punchy', 'cinematic' (default: 'clean')
+//   - reference (optional): Reference track for EQ matching
+//
+// Response: { job_id, status, message }
+// ---------------------------------------------------------------------------
+const PRESET_NAMES = ["clean", "warm", "punchy", "cinematic", "club_remix", "rnb_enhance", "hiphop_remix", "cinematic_atmos"];
+const CREATIVE_PRESETS = new Set(["club_remix", "rnb_enhance", "hiphop_remix", "cinematic_atmos"]);
+
+// Multer config for mastering — accepts target file + optional reference
+const masterUpload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (req, file, cb) => {
+    const allowed = [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".aiff"];
+    if (allowed.includes(path.extname(file.originalname).toLowerCase())) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported: ${path.extname(file.originalname)}`));
+    }
+  },
+});
+
+router.post("/master", masterUpload.fields([
+  { name: "file", maxCount: 1 },
+  { name: "reference", maxCount: 1 },
+]), async (req, res) => {
+  try {
+    const targetFile = req.files?.file?.[0];
+    if (!targetFile) {
+      return res.status(400).json({ error: "No audio file uploaded. Use field name 'file'." });
+    }
+
+    const preset = PRESET_NAMES.includes(req.body?.preset) ? req.body.preset : "clean";
+    const refFile = req.files?.reference?.[0] || null;
+    const isCreative = CREATIVE_PRESETS.has(preset);
+
+    const job = jobManager.createJob(
+      `master_${targetFile.originalname}`,
+      targetFile.path
+    );
+    jobManager.updateJobStatus(job.id, "processing", { preset, type: isCreative ? "creative_remix" : "master" });
+
+    console.log(`[Master] Job ${job.id}: preset=${preset} (${isCreative ? "creative" : "standard"}), ref=${refFile?.originalname || 'none'}`);
+
+    // Run mastering async on VPS CPU — use creative pipeline for creative presets
+    const { execFile } = require("child_process");
+    const studioDir = path.join(__dirname, "..", "..", "..", "..", "hermes-workspace", "studio-api", "mastering");
+    const scriptPath = isCreative
+      ? path.join(studioDir, "run_remix.py")
+      : path.join(studioDir, "run_master.py");
+    const outputPath = path.join(STORAGE_DIR, "stems", job.id, "mastered.wav");
+
+    // Ensure output directory
+    const outDir = path.dirname(outputPath);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+    const args = [
+      scriptPath,
+      "--input", targetFile.path,
+      "--output", outputPath,
+      "--preset", preset,
+    ];
+    if (refFile) {
+      args.push("--reference", refFile.path);
+    }
+
+    execFile("python3", args, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[Master] Job ${job.id} failed:`, stderr || err.message);
+        jobManager.updateJobStatus(job.id, "error", {
+          error: stderr || err.message,
+          type: "master",
+        });
+      } else {
+        try {
+          const report = JSON.parse(stdout);
+          console.log(`[Master] Job ${job.id} done:`, JSON.stringify(report).slice(0, 200));
+          jobManager.updateJobStatus(job.id, "done", {
+            output_path: outputPath,
+            report,
+            type: "master",
+          });
+        } catch (parseErr) {
+          console.log(`[Master] Job ${job.id} done (raw output)`);
+          jobManager.updateJobStatus(job.id, "done", {
+            output_path: outputPath,
+            type: "master",
+          });
+        }
+      }
+    });
+
+    return res.status(201).json({
+      job_id: job.id,
+      status: "processing",
+      preset,
+      message: `Mastering started with "${preset}" preset.`,
+    });
+  } catch (err) {
+    console.error("[Master] Error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/remaster/presets
+// ---------------------------------------------------------------------------
+// Returns the available mastering presets and their descriptions.
+// ---------------------------------------------------------------------------
+router.get("/presets", (req, res) => {
+  return res.json({
+    presets: {
+      clean: { name: "Clean Studio", description: "Transparent, dynamic. Streaming-ready.", lufs: -14 },
+      warm: { name: "Warm Analog", description: "Rich vintage tape warmth. For R&B, soul, acoustic.", lufs: -12 },
+      punchy: { name: "Punchy & Loud", description: "Aggressive, loud master. For hip-hop, trap, EDM.", lufs: -9 },
+      cinematic: { name: "Cinematic Wide", description: "Epic soundstage. For orchestral, ambient, trailers.", lufs: -14 },
+      club_remix: { name: "Club Remix ✦", description: "Festival-ready with harmonies, synth layers & builds.", lufs: -9, creative: true },
+      rnb_enhance: { name: "R&B Enhancement ✦", description: "Rich harmonies, warm pads & silky vocal layers.", lufs: -12, creative: true },
+      hiphop_remix: { name: "Hip-Hop Remix ✦", description: "Heavy 808s, vocal layers & aggressive presence.", lufs: -9, creative: true },
+      cinematic_atmos: { name: "Cinematic Atmos ✦", description: "Epic soundscape with evolving textures & depth.", lufs: -14, creative: true },
+    },
+  });
 });
 
 module.exports = router;
